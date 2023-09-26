@@ -1,0 +1,272 @@
+---
+title: Analyzing the relationship between the CBOE Volatility Index (VIX) and the
+  Federal Funds Effective Rate at the monthly level
+author: "Mihnea Tatu-Chitoiu"
+date: "2023-07-10"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+I. Introduction
+
+The purpose of this research project is to analyze the performance of two forecasting models (Arima, dynamic regression model with 6 Fourier sin and cos pairs) on two time-series: the CBOE Volatility Index (VIX): https://fred.stlouisfed.org/series/VIXCLS and on the percentage change in the Federal Funds Effective Rate: https://fred.stlouisfed.org/series/DFF. I will use the best forecasting model for each of the two time-series to predict their values over the next two years.
+
+I will then inspect the relationship between these two-time series by building a Vector Autoregressive (VAR) model. This will help me assess how a shock in the CBOE Volatility Index (VIX) / change in Federal Funds Effective Rate will affect the future values of the change in the Federal Funds Effective Rate / CBOE Volatility Index (VIX). It will also enable me to produce an additional forecast for each of the two time-series over the next two years.
+
+I begin the project by clearing the environment and loading some of the libraries I will be using.
+
+```{r, warnings= FALSE, message=FALSE}
+rm(list=ls(all=TRUE))
+library(forecast)
+library(quantmod)
+library(dplyr)
+library(tseries)
+library(ggplot2)
+library(stats)
+library(xts)
+library(dynlm)
+library(tsibble)
+library(seasonal)
+library(tis)
+library(Metrics)
+```
+
+The first time-series I downloaded from the Fred's (Federal Reserve Bank of St. Louis) website is the the CBOE Volatility Index (VIX). The VIX "is a real-time market index representing the market’s expectations for volatility over the coming 30 days" (Kuepper et al.). The Chicago Board of Options Exchange (CBOE) derives its value from the prices of S&P 500 options whose expiration dates are "more than 23 days and less than 37 days" ("VIX Calculation Explained") away from the moment when the index is computed. While going through a step-by-step process on how the VIX is computed is beyond the scope of this project, it is important to mention that the value of the VIX increases/decreases when demand for S&P 500 options increases/decreases. This is because an increased demand for such options causes their prices, which are pozitively correlated with the VIX through the index's formula, to appreciate. Furthermore, the demand for and price of S&P 500 options rises "when investors anticipate large upswings or downswings in stock prices (so they) look to reduce risk by using options to ‘hedge’ their positions" ("VIX: What you should know about the volatility index"). Such events cause the VIX to rise and demonstrate that the index directly reflects the volatility expectations of market participants. For this project, I store the historical end-of-month values of the VIX from February 1990 to June 2023 in a time-series object I call "vix". I also create an additional time-series object called "vixtrain" where I store the historical end-of-month values for the VIX from February 1990 to December 2016. I will use "vixtrain" to train several models whose forecasts I will compare with the actual VIX data from February 2017 to June 2023.
+
+The second time-series I downloaded from the FRED's (Federal Reserve Bank of St. Louis) website is the Federal Funds Effective Rate. Its value is derived from the Federal Funds Rate, which is the target "interest rate that banks charge other institutions for lending excess cash to them from their reserve balances on an overnight basis" (Chen et al.). The value of the Federal Funds Effective Rate is obtained by computing the median of the "weighted...[rates] for all of these types of negotiations" ("Federal Funds Effective Rate [DFF]"). I store the historical end-of-month Federal Funds Effective Rate from January 1990 to June 2023 in a time-series object I call "funds" and the historical monthly change in the Federal Funds Effective Rate over the same period in a time-series object I call "changets". I also create two additional time-series objects: "fundstrain", where I store the historical end-of-month Federal Funds Effective Rate from January 1990 to December 2016, and "changetraints", where I store the historical monthly change in the Federal Funds Effective Rate over the same period. I need "changetraints" to train several models whose forecasts will be compared with the actual change in the Federal Funds Effective Rate from January 2017 to June 2023.
+
+```{r}
+getSymbols("VIXCLS", src="FRED")
+getSymbols("DFF",src="FRED")
+VIXCLS<-to.monthly(VIXCLS, OHLC=FALSE)
+VIXCLS <- VIXCLS[-1, ]
+vix<-as.ts(VIXCLS, start=c(1990,2), end=c(2023,6))
+vixtrain<-as.ts(VIXCLS,start=c(1990,2), end=c(2016,12))
+DFF<-to.monthly(DFF, OHLC=FALSE)
+funds<-ts(DFF, start=c(1954,7), end=c(2023,7), frequency=12) %>%
+  window(start=c(1990,1), end=c(2023,6), frequency=12)
+fundstrain<-ts(DFF, start=c(1954,7), end=c(2023,7), frequency=12) %>%
+  window(start=c(1990,1), end=c(2016,12), frequency=12)
+change <- (funds[-1] - funds[-length(funds)]) / funds[-length(funds)] * 100
+changets<-ts(change, start=c(1990,2),end=c(2023,6),frequency=12)
+changetrain<- (fundstrain[-1] - fundstrain[-length(fundstrain)]) / fundstrain[-length(fundstrain)] * 100
+changetraints<-ts(changetrain, start=c(1990,2),end=c(2016,12),frequency=12)
+```
+
+II. Forecasting the VIX
+
+Below I plot end-of-month VIX from February 1990 to December 2016. It appears that this time-series exhibits cycles, as high values are observed in the years immediately preceding and following recessions (shaded in gray), while low values are observed the further away we are from a recession.
+
+```{r}
+plot(vixtrain, main="VIX", xlab="Year", ylab="Monthly VIX")
+nberShade()
+```
+
+Before fitting models to this data, I ask R if the data is stationary by performing an Augmented Dickey-Fuller test. R tells me that it is, as it does not need to be differenced to reach stationarity. 
+
+```{r}
+ndiffs(vixtrain, test="adf")
+```
+
+I now compute the autocorrelation functions for "vixtrain". The ACF experiences a sinusoidal decrease, while the PACF experiences a sharp cutoff after its first significant lag. 
+
+```{r}
+tsdisplay(vixtrain, main="Autocorrelation functions for the monthly CBOE Volatility Index (VIX)")
+```
+
+I first fit an Arima model to the data by using the auto.arima function. I call this model "vix1". R selects an Arima (2,0,2)(1,0,0)[12] model with non-zero mean. The plot of this model's residuals resemble white noise and their histogram is centered around 0. The Ljung-Box test for the residuals returns a p-value greater than 0.05, so I conclude that they are not correlated. Thus, the Arima model selected by R cannot be improved.
+
+```{r}
+vix1<-auto.arima(vixtrain)
+checkresiduals(vix1)
+```
+
+I also ask R to fit a dynamic regression with 2 Fourier sin and cos pairs, which I call "vix2". The plot of this model's residuals resemble white noise and their histogram is centered around 0. This, combined with the fact the the Ljung-Box test for the residuals returns a p-value considerably higher than 0.05, leads me to conclude that the residuals are not correlated. Thus, the dynamic regression with 2 Fourier sin and cos pairs cannot be improved.
+
+```{r}
+library(ineq)
+library(fpp3)
+vixtrain_tsibble<-as_tsibble(vixtrain)
+vix2 <- model(vixtrain_tsibble, ARIMA(log(value) ~ fourier(K=2) + PDQ(0,0,0)))
+checkresiduals(vix2[[1]][[1]][["fit"]][["est"]][[".resid"]])
+```
+
+I then plot the forecasts computed by the Arima and dynamic regression models over for the period of January 2017 to June 2023 to compare the results obtained by the forecasts with the actual values of the VIX. It is difficult to visually assess which forecast produced the better results since the dynamic regression model captures some of the volatile nature of the VIX but sometimes goes in the opposite direction of the index, while the Arima model does not go in the opposite direction of the index but fails to capture the volatile nature of the VIX.
+
+```{r}
+p1<-forecast(vix1,h=78)
+fourier_forecast<-vix2 |>
+  forecast(h="78 months") 
+p2<-ts(fourier_forecast$.mean, start=c(2017,1), end=c(2023,6), frequency=12)
+autoplot(vix, main=("VIX"), xlab="Year", ylab="Monthly VIX") +
+autolayer(p1, series="Predicted VIX from Arima", PI=FALSE) +
+autolayer(p2, series="Predicted VIX from Dynamic Regression") 
+```
+
+To decide which forecast is a better predictor of the VIX, I compute the RMSEs (Root Mean Squared Errors) of the two models over the period for which they produced their forecasts. The Arima model has a slightly lower RMSE, so it is more accurate than the dynamic regression model.
+
+```{r}
+vixtest<- vix|>
+  window(start=c(2017,1), end=c(2023,6))
+rmse(vixtest,p1$mean)
+rmse(vixtest,p2)
+```
+
+As a final step for the VIX, I forecast its values over the next two years (June 2023 to May 2025) using the Arima (2,0,2)(1,0,0)[12] with non-zero mean model selected by R. The forecast indicates that VIX will initially exhibit a quick increase reaching ~17.85 by the end of 2023, after which it will continues to increase, although at a much slower pace, over the forecasted period. The Arima model computes a ~18.96 value for the VIX for June 2025.
+
+```{r}
+vix_model<-Arima(vix, model=vix1)
+forecasted_vix <- forecast(vix_model, h = 24)
+forecasted_values <- forecasted_vix$mean 
+autoplot(vix, xlab = "Year", ylab = "Monthly Vix", main = "VIX") +
+autolayer(forecasted_values, series="Forecasted values from ARIMA")
+```
+
+III. Forecasting the change in the Federal Funds Effective Rate
+
+I now switch my attention to the monthly change in the Federal Funds Effective Rate form February 1990 to June 2023. This plot also seems to exhibits cycles, as the Federal Funds Effective Rate exhibits significant decreases during recessions (shaded in gray), only for its value to rebound quickly after the end of recessions. 
+
+```{r}
+plot(changetraints, main="Monthly percentage change in Federal Funds Effective Rate", xlab="Year", ylab="Percentage Change")
+nberShade()
+```
+
+Before fitting models to the monthly percentage change in the Federal Funds Effective Rate, I ask R if the data is stationary by performing an Augmented Dickey-Fuller test. R tells me that it is, as it does not need to be differenced to reach stationarity. 
+
+```{r}
+ndiffs(changets, test=c("adf"))
+```
+
+I now compute the autocorrelation functions for "changetraints". The plot of the ACF is highly persistent, while the PACF experiences a cutoff after the third lag. Seasonality may also be present, as several lags that are multiples of twelve are significant for both the ACF and the PACF. 
+
+```{r}
+tsdisplay(changetraints, main="Autocorrelation functions for the monthly change in the Federal Funds Effective Rate")
+```
+
+Based on the autocorrelation functions of the differenced "changetraints", I fit an ARIMA(3,0,2)(2,0,0)[12] model to the data which I call "change1". The plot of this model's residuals resemble white noise and their histogram is centered around 0. The Ljung-Box test for the residuals returns a p-value greater than 0.05, so I conclude that they are not correlated. Thus, this Arima model cannot be improved.
+
+```{r}
+change1<-Arima(changetraints, order=c(3,0,2), seasonal=c(2,0,0))
+checkresiduals(change1)
+```
+
+I then ask R to fit an Arima model to the data by using the auto.arima function. R selects an Arima (2,1,3)(0,0,2)[12] model with zero mean, which I call "change2". The plot of this model's residuals resemble white noise and their histogram is centered around 0. The Ljung-Box test for the residuals returns a p-value much greater than 0.05, so I conclude that they are not correlated. Thus, this Arima model cannot be improved.
+
+```{r}
+change2<-auto.arima(changetraints)
+checkresiduals(change2)
+```
+
+I then plot the forecasts computed by the two Arima models over for the period of January 2017 to May 2023 to compare the results obtained by the forecasts with the actual values of the change in the Federal Funds Effective Rate composite indicator. It is difficult to visually assess which forecast is better since they produced similar results.
+
+```{r}
+r1<-forecast(change1,h=78)
+r2<-forecast(change2,h=78)
+autoplot(changets,main=("Monthly change in the Federal Funds Effective Rate"), xlab="Year", ylab=("Percentage change")) +
+  autolayer(r1, series="Predicted change from ARIMA(3,0,2)(2,0,0)[12]", PI=FALSE) +
+  autolayer(r2, series="Predicted change from (2,1,3)(0,0,2)[12]", PI=FALSE)
+```
+
+To decide which forecast produced better results, I compute the RMSEs (Root Mean Squared Errors) of the two models over the period for which they produced their forecasts. The Arima (2,1,3)(0,0,2)[12] has a lower RMSE, so it is more accurate than the ARIMA(3,0,2)(2,0,0)[12] model.
+
+```{r}
+changetest<- changets|>
+  window(start=c(2017,1), end=c(2023,6))
+rmse(changetest, r1$mean)
+rmse(changetest, r2$mean)
+```
+
+As a final step for the change in the Federal Funds Effective Rate, I forecast its values over the next two years (July 2023 to June 2025) using the ARIMA(2,1,3)(0,0,2)[12] model. The forecast indicates that the Change in the Federal Funds Effective Rate will increase at an accelerated pace over the next year. It will then decrease but continue to be pozitive as it reaches ~7.47 in June 2025.
+
+```{r}
+change_model<-Arima(changets, model=change2)
+forecasted_change <- forecast(change_model, h = 24)
+forecasted_values2 <- forecasted_change$mean 
+autoplot(changets, xlab = "Year", ylab = "Percentage Change", main = "Monthly percentage change in Federal Funds Effective Rate") +
+autolayer(forecasted_values2, series="Forecasted values from ARIMA(2,1,3)(0,0,2)[12]")
+```
+
+IV. Vector Autoregressive Model
+
+I now proceed to fit a Vector Autoregressive (VAR) model using the end-of-month VIX and monthly change in the Federal Funds Effective rate. To do this, I use the "VARselect" function to ask R how many lags from each time-series I should include in the model. Based on the AIC selection criterion, I decide to proceed with a VAR(9) model.
+
+```{r}
+library(vars)
+y3=cbind(vix, changets)
+y_tot3=data.frame(y3)
+VARselect(y_tot3, lag.max = 10)
+```
+
+Below I fit a VAR(9) model for my two time series. The results indicate that only the fifth lag of the monthly change in the Federal Funds Effective Rate is slightly significant in predicting the VIX. On the other hand, the fourth, fifth, and seventh lags of the VIX are very significant in predicting the monthly change in the Federal Funds Effective Rate. combined with the first and fourth lag of the VIX, are helpful in predicting the current level of the VIX. 
+
+```{r}
+y_model3=VAR(y3,p=9)
+summary(y_model3)
+```
+
+To obtain a better understanding of how the two time-series influence each other, I plot their impulse response functions. The cross-variable impulse response for the VIX indicates that it is not seriously impacted by a shock in the monthly change of the Federal Funds Effective Rate. The own-variable impulse response indicates that a shock in the VIX will have a serious impact on its value over the following 7-8 months. 
+
+```{r}
+vixirf1<-irf(y_model3, impulse="changets", response="vix", n.ahead=24)
+vixirf2<-irf(y_model3, impulse="vix", response="vix", n.ahead=24)
+plot(vixirf1)
+plot(vixirf2)
+```
+
+The cross-variable impulse response for monthly change in the Federal Funds Effective Rate indicates that it is seriously impacted by a shock in the VIX. A shock in the VIX will considerably affect the change in the Federal Funds Effective Rate for over one year. The own-variable impulse response indicates that a shock in the monthly change of the Federal Funds Effective Rate will have a serious impact on its value over the following 18 months. 
+
+```{r}
+changetsirf1<-irf(y_model3, impulse="vix", response="changets", n.ahead=24)
+changetsirf2<-irf(y_model3, impulse="changets", response="changets", n.ahead=24)
+plot(changetsirf1)
+plot(changetsirf2)
+changetsirf1[["irf"]][["vix"]]
+```
+
+To further assess predictive dynamics between the two time-series, I conduct two Granger-Causality tests. 
+
+The first test assesses the effectiveness of using lags of the change in the monthly Federal Funds Effective Rate in predicting the VIX. Since the p-value of its test is much higher than 0.05, I conclude that the lags of the of the change in the monthly Federal Funds Effective Rate are not useful in predicting the future values of the VIX.
+
+The second test assesses the effectiveness of using lags of the VIX in predicting the monthly change in the Federal Funds Effective Rate. Since the p-value returned for this test is much lower than 0.05, I conclude that the lags of the VIX are very useful in predicting the future values of the Federal Funds Effective Rate.
+
+```{r}
+grangertest(vix~ changets, order=9)
+grangertest(changets~ vix, order=9)
+```
+
+Finally, I use the VAR model to produce an additional forecast over a two-year horizon for both the VIX and the change in the Federal Funds Effective Rate. The results indicate that the VIX will steadily grow over the next two years, reaching ~18.84 in June 2025. On the other hand, the change in the Federal Funds Effective Rate will experience a more volatile behavior, as it is expected to experience months of growth as well as months of decline. It is predicted to grow by ~3.78% in June 2025.
+
+```{r}
+var.predict = predict(object=y_model3, n.ahead=24)
+dev.new(width = 7, height = 100)
+plot(var.predict)
+```
+
+```{r}
+library('magick')
+img<-image_read("/Users/sandinatatu/Desktop/Screenshot 2023-07-11 at 2.47.48 AM.png")
+plot(img)
+```
+
+V. Conclusion
+
+Since the Granger causality test indicated that the monthly change in the Federal Funds Effective Rate is not helpful in predicting the VIX, it is likely that the future values of the VIX over the next two years are closer to the ones from the forecast produced by the ARIMA model in part II than to the ones produced by the VAR model. On the other hand, it is likely that the VAR model is more helpful in predicting the monthly change in the Federal Funds Effective Rate than the ARIMA(2,1,3)(0,0,2)[12] model used in part III. This is because the ARIMA(2,1,3)(0,0,2)[12] predicted that the change in the Federal Funds Effective Rate will be pozitive for every month of the next two years, which is highly unlikely since such an event would have negative effects on the growth of the US Economy.
+
+Works Cited
+
+Chicago Board Options Exchange, CBOE Volatility Index: VIX [VIXCLS], retrieved from FRED, Federal Reserve Bank of St. Louis; https://fred.stlouisfed.org/series/VIXCLS
+
+Board of Governors of the Federal Reserve System (US), Federal Funds Effective Rate [DFF], retrieved from FRED, Federal Reserve Bank of St. Louis; https://fred.stlouisfed.org/series/DFF
+
+Kuepper, Justin. “Cboe Volatility Index (VIX): What Does It Measure in Investing?” Investopedia, www.investopedia.com/terms/v/vix.asp. 
+
+“Vix Calculation Explained.” Macroption, www.macroption.com/vix-calculation/. 
+Fidelity International, www.fidelity.com.sg/articles/pages/2019-08-27-vix-what-you-should-know-about-the-volatility-index-1566874437774#:~:text=The%20VIX%20is%20based%20on,for%20the%20next%2030%20days. 
+
+Chen, James. “Federal Funds Rate: What It Is, How It’s Determined, and Why It’s Important.” Investopedia, www.investopedia.com/terms/f/federalfundsrate.asp. 
+
